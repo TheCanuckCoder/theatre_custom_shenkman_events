@@ -1,0 +1,980 @@
+<?php
+
+/**
+ *  Implements hook_cron()
+ */
+function theatrecustom_events_cron()
+{
+  /////////  set the next_start_date values for applicable events /////////
+
+  // TODO: only load the ones we need to
+  $query = new EntityFieldQuery();
+
+  // TODO: 1. anything with a past max_start_date should have a null next_start_date
+  // TODO: 2. once 1 is node, the query below should only fetch items with max_start_date >= now values
+
+  $result = $query
+  ->entityCondition('entity_type', 'node')
+  ->propertyCondition('type', array('event', 'camp', 'class', 'exhibition'), 'IN')
+  ->execute();
+
+  if (isset($result['node']))
+  {
+    foreach($result['node'] as $row)
+    {
+      $node = node_load($row->nid, NULL, TRUE);
+      $orig_value = isset($node->field_next_start_date['und'][0]['value']) ? $node->field_next_start_date['und'][0]['value'] : NULL;
+      theatrecustom_events_node_set_next_start_date($node);
+
+      // only save if the value has changed
+      if (isset($node->field_next_start_date['und'][0]['value'])
+      && $node->field_next_start_date['und'][0]['value'] != $orig_value)
+      {
+        node_save($node);
+      }
+    }
+  }
+}
+
+
+/**
+ *
+ */
+function theatrecustom_events_form_alter(&$form, &$form_state, $form_id)
+{
+  // Remove "next start date" field from all forms
+  if (isset($form['field_next_start_date']))
+  {
+    $form['field_next_start_date']['#access'] = FALSE;
+  }
+}
+
+
+/**
+ *  Implements hook_menu()
+ */
+function theatrecustom_events_menu()
+{
+  $items = array();
+
+  /*
+  $items['events/compute/%'] = array(
+    'title' => 'Compute Test',
+    'page callback' => 'theatrecustom_events_test',
+    'page arguments' => array(2),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+  );
+  */
+
+  $items['admin/config/rebuild_events_sapi_index'] = array(
+    'title' => 'Rebuild Index',
+    'page callback' => '_theatrecustom_events_sapi_rebuild_events_index',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+  );
+
+  $items['admin/config/content/events'] = array(
+    'title'            => t('Event Settings'),
+    'description'      => t('Control various settings related to Event handling.'),
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('theatrecustom_events_settings_form'),
+    'access callback'  => 'user_access',
+    'access arguments' => array('administer events settings'),
+    'file'             => 'theatrecustom_events.admin.inc',
+  );
+
+  // params:
+  //  - node
+  //  - field name
+  //  - field collection id
+  //  - field collection name
+  //  - field collection delta
+  $items['events/addcal/ical/%node/%/%/%/%'] = array(
+    'page callback' => 'theatrecustom_events_addcal',
+    'page arguments' => array('ical', 3, 4, 5, 6, 7, 8),
+    'access callback' => 'node_access',
+    'access arguments' => array('view', 3),
+  );
+
+  $items['events/addcal/google/%node/%/%/%/%'] = array(
+    'page callback' => 'theatrecustom_events_addcal',
+    'page arguments' => array('google', 3, 4, 5, 6, 7, 8),
+    'access callback' => 'node_access',
+    'access arguments' => array('view', 3),
+  );
+
+  $items['events/addcal/yahoo/%node/%/%/%/%'] = array(
+    'page callback' => 'theatrecustom_events_addcal',
+    'page arguments' => array('yahoo', 3, 4, 5, 6, 7, 8),
+    'access callback' => 'node_access',
+    'access arguments' => array('view', 3),
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implmentation of hook_permission();
+ */
+function theatrecustom_events_permission()
+{
+  return array(
+    'administer events settings' => array(
+      'title' => t('Administer events settings'),
+    ),
+  );
+}
+
+
+/**
+ *  Used for testing and debugging
+ */
+function theatrecustom_events_test($nid)
+{
+  $node = node_load($nid);
+  if (!in_array($node->type, array('event', 'class', 'camp', 'exhibition'))) return;
+  $ret = theatrecustom_events_node_calc_dates($node);
+
+  echo '<xmp style="background-color:#fff; color:#000;">';
+  print_r($ret);
+  print_r($node);
+  echo '</xmp>';
+  die;
+}
+
+
+/**
+ *  Calculates stats such as min/max dates for field_dates
+ *  @param presave Are we being called via the pre-save hook?
+ */
+function theatrecustom_events_node_calc_dates($node, $presave=FALSE)
+{
+  // basic sanity check
+  if (empty($node->nid)) return;
+
+  // min_date is always based on the earliest start date
+  $min_date = NULL;
+
+  // max_date is the latest end date (if exists), or the latest start date
+  $max_date = NULL;
+  $min_start_date = NULL;
+  $max_start_date = NULL;
+  $max_end_date = NULL;
+
+  // calculates the nearest start date that is in the future
+  $next_start_date = NULL;
+
+  $current_date = date('Y-m-d H:i:s');
+
+  $dates_field = NULL;
+
+  switch($node->type) {
+    case 'event':
+      $dates_field =& $node->field_dates;
+      $date_field_name = 'field_preferred_dates';
+      break;
+    case 'camp':
+      $dates_field =& $node->field_camp_dates;
+      $date_field_name = 'field_preferred_dates';
+      break;
+    case 'class':
+      $dates_field =& $node->field_class_dates;
+      $date_field_name = 'field_preferred_dates';
+      break;
+    case 'exhibition':
+      $dates_field =& $node->field_date_range;
+      $date_field_name = 'field_date_range';
+      break;
+  }
+
+
+  if (empty($dates_field['und'])) return;
+
+  foreach($dates_field['und'] as $value_array)
+  {
+    if (in_array($node->type, array('class', 'camp', 'event'))) {
+      // during the presave hook, the node object we are passed in is structured differently
+      if ($presave)
+      {
+        $entity = new StdClass();
+        $entity->field_preferred_dates = $value_array['field_preferred_dates'];
+      }
+      else
+      {
+        $fcid = $value_array['value'];
+        $conditions = array();
+        $entities = entity_load('field_collection_item', array($fcid), $conditions, TRUE);
+        $entity = array_pop($entities);
+      }
+    }
+    else
+    {
+      $entity = $node;
+    }
+
+    // if there are no dates set, there's no need to finish the loop
+    if (empty($entity->{$date_field_name}['und'])) continue;
+
+    foreach($entity->{$date_field_name}['und'] as $date_array)
+    {
+      $start_date = !empty($date_array['value']) ? $date_array['value'] : NULL;
+      $end_date = !empty($date_array['value2']) ? $date_array['value2'] : NULL;
+
+      if (empty($next_start_date)) $next_start_date = $start_date;
+
+      if (!empty($start_date))
+      {
+        // check for min start date
+        if (empty($min_start_date)
+        || $start_date < $min_start_date)
+        {
+          $min_start_date = $start_date;
+        }
+
+        // check for min start date
+        if (empty($max_start_date)
+        || $start_date > $max_start_date)
+        {
+          $max_start_date = $start_date;
+        }
+
+        // check for next start date
+        if ($start_date > $current_date)
+        {
+          if (empty($next_start_date)
+          || $start_date < $next_start_date)
+          {
+            $next_start_date = $start_date;
+          }
+        }
+      }
+
+      // check for max end date
+      if (!empty($end_date))
+      {
+        if (empty($max_end_date)
+        || $end_date > $max_end_date)
+        {
+          $max_end_date = $end_date;
+        }
+      }
+    }
+  }
+
+  $min_start_date_dt = DateTime::createFromFormat('Y-m-d H:i:s', $min_start_date);
+  $max_start_date_dt = DateTime::createFromFormat('Y-m-d H:i:s', $max_start_date);
+  $max_end_date_dt = DateTime::createFromFormat('Y-m-d H:i:s', $max_end_date);
+  $next_start_date_dt = DateTime::createFromFormat('Y-m-d H:i:s', $next_start_date);
+
+  $min_date = $min_start_date;
+  $min_date_dt = $min_start_date_dt;
+
+  // TODO: should be calculating this instead of assuming that end date is after start date
+  $max_date = $max_end_date ? $max_end_date : $max_start_date;
+  $max_date_dt = $max_end_date ? $max_end_date_dt : $max_start_date_dt;
+
+  if ($min_date && $max_date)
+  {
+    $ret = array(
+      // the earliest start date
+      'min_date' => $min_date,
+
+      // the latest start or end date
+      'max_date' => $max_date,
+
+      // the earliest start date
+      'min_start_date' => $min_start_date,
+      'min_start_date_ts' => $min_start_date_dt ? $min_start_date_dt->getTimestamp() : NULL,
+
+      // the latest start date
+      'max_start_date' => $max_start_date,
+      'max_start_date_ts' => $max_start_date_dt ? $max_start_date_dt->getTimestamp() : NULL,
+
+      // the latest end date
+      'max_end_date' => $max_end_date,
+      'max_end_date_ts' => $max_end_date_dt ? $max_end_date_dt->getTimestamp() : NULL,
+
+      // closest future start date
+      'next_start_date' => $next_start_date,
+      'next_start_date_ts' => $next_start_date_dt ? $next_start_date_dt->getTimestamp() : NULL,
+    );
+  }
+  else
+  {
+    $ret = FALSE;
+  }
+
+  return $ret;
+}
+
+
+/**
+ *  Implements hook_node_presave()
+ */
+function theatrecustom_events_node_presave($node)
+{
+  // this causes eveything to come up blank
+  // theatrecustom_events_node_set_next_start_date($node, TRUE, TRUE);
+}
+
+
+/**
+ *
+ */
+function theatrecustom_events_node_set_next_start_date(&$node, $presave=FALSE)
+{
+  $values = theatrecustom_events_node_calc_dates($node, $presave);
+
+  if ($values['next_start_date'])
+  {
+    $node->field_next_start_date['und'][0] = array(
+      'value' => $values['next_start_date'],
+      'show_todate' => NULL,
+      'offset' => '-18000',
+      'offset2' => '-18000',
+      'value2' => $values['next_start_date'],
+      'date_type' => 'datetime',
+    );
+  }
+  else
+  {
+    $node->field_next_start_date['und'] = array();
+  }
+}
+
+
+/**
+ *  Sorts the field_date array for an event node based on the start dates
+ */
+function theatrecustom_events_sort_field_date($node)
+{
+  switch($node->type) {
+    case 'event':
+      $dates_field =& $node->field_dates;
+      break;
+    case 'camp':
+      $dates_field =& $node->field_camp_dates;
+      break;
+    case 'class':
+      $dates_field =& $node->field_class_dates;
+      break;
+  }
+
+  if (!empty($dates_field['und']) && is_array($dates_field['und']))
+  {
+    foreach($dates_field['und'] as $key=>$values)
+    {
+      $fcid = $values['value'];
+
+      $conditions = array();
+      $fc_items = entity_load('field_collection_item', array($fcid), $conditions, TRUE);
+      $fc_item = array_pop($fc_items);
+
+      $dates_field['und'][$key]['start_date'] =
+        isset($fc_item->field_preferred_dates['und'][0]['value'])
+        ? $fc_item->field_preferred_dates['und'][0]['value']
+        : NULL;
+    }
+
+    // sort the dates array by the start date
+    usort($dates_field['und'], 'theatrecustom_events_datesort');
+  }
+
+  return $node;
+}
+
+
+/**
+ *  Provides a comparison function for the date array sort
+ */
+function theatrecustom_events_datesort($a, $b)
+{
+  return ($a['start_date'] > $b['start_date']);
+}
+
+
+/**
+ *
+ *  Computed Fields section
+ *
+ */
+
+// Computed Field module callback
+function computed_field_field_min_start_date_compute(&$entity_field, $entity_type, $entity, $field, $instance, $langcode, $items)
+{
+  $values = theatrecustom_events_node_calc_dates($entity);
+  $entity_field[]['value'] = $values['min_start_date_ts'];
+}
+
+// Computed Field module callback
+function computed_field_field_max_start_date_compute(&$entity_field, $entity_type, $entity, $field, $instance, $langcode, $items)
+{
+  $values = theatrecustom_events_node_calc_dates($entity);
+  $entity_field[]['value'] = $values['max_start_date_ts'];
+}
+
+// Computed Field module callback
+function computed_field_field_max_end_date_compute(&$entity_field, $entity_type, $entity, $field, $instance, $langcode, $items)
+{
+  $values = theatrecustom_events_node_calc_dates($entity);
+  $entity_field[]['value'] = $values['max_end_date_ts'];
+}
+
+// Computed Field module callback
+function computed_field_field_promo_code_url_compute(&$entity_field, $entity_type, $entity, $field, $instance, $langcode, $items)
+{
+  $default_url = variable_get('theatrecustom_events_promo_def_url', '');
+  $use_default_url = isset($entity->field_promo_use_def_url['und'][0]['value']) && $entity->field_promo_use_def_url['und'][0]['value'] ? TRUE : FALSE;
+  $alt_url = isset($entity->field_promo_alt_url['und'][0]['url']) ? $entity->field_promo_alt_url['und'][0]['url'] : NULL;
+  $promo_code_url = (string) ($use_default_url ? $default_url : $alt_url);
+
+  $entity_field[0]['value'] = $promo_code_url;
+}
+
+
+/**
+ *  Handler for "add to calendar" functionality
+ */
+function theatrecustom_events_addcal($cal_type, $node, $field_name, $fc_item_id, $fc_field_name, $fc_delta)
+{
+  global $language;
+
+  $supported_fields = array(
+    'field_dates',
+    'field_class_dates',
+    'field_camp_dates',
+    'field_date_range',
+    'field_vernissage_date',
+    'field_mta_date',
+    'field_artist_talk_date',
+  );
+
+  if (($node->type != 'event' && $node->type != 'class' && $node->type != 'camp') 
+  || !in_array($field_name, $supported_fields))
+  {
+    // TODO: better logging?
+    echo t('Invalid calendar parameters specified ' . $node->type . ' ' . $field_name);
+    die;
+  }
+
+  $info = array();
+
+  $info['filename'] = preg_replace('/[\x00-\x1F]/u', '_', strip_tags($node->title));
+
+  $info['title'] = check_plain($node->title);
+  if ($field_name == 'field_vernissage_date') $info['title'] .= ' (' . t('Vernissage') . ')';
+  if ($field_name == 'field_mta_date') $info['title'] .= ' (' . t('Meet the Artists') . ')';
+  if ($field_name == 'field_artist_talk_date') $info['title'] .= ' (' . t('Artist Talk') . ')';
+
+  $info['url'] = url('node/' . $node->nid, array('absolute'=>TRUE));
+
+  $info['uid'] = 'event-';
+  $info['uid'] .= implode('-', array(
+    $node->nid,
+    $field_name,
+    $fc_item_id,
+    $fc_field_name,
+    $fc_delta,
+  ));
+  $info['uid'] .= '@' . $_SERVER['HTTP_HOST'];
+  $info['uid'] = drupal_html_class($info['uid']);
+
+  if ($fc_item_id)
+  {
+    $fc_items = entity_load('field_collection_item', array($fc_item_id));
+    $fc_item = array_pop($fc_items);
+
+    // dates
+    $info['start_date'] = $fc_item->field_preferred_dates['und'][0]['value'];
+    $info['end_date'] = isset($fc_item->field_preferred_dates['und'][0]['value2']) ? $fc_item->field_preferred_dates['und'][0]['value2'] : $info['start_date'];
+
+    $start_dt   = new DateTime($info['start_date']);
+    $end_dt     = new DateTime($info['end_date']);
+  }
+  else
+  {
+    $info['start_date'] = $node->{$field_name}['und'][0]['value'];
+    $info['end_date'] = isset($node->{$field_name}['und'][0]['value2']) ? $node->{$field_name}['und'][0]['value2'] : $info['start_date'];
+
+    $start_dt   = new DateTime($info['start_date']);
+    $end_dt   = new DateTime($info['end_date']);
+  }
+
+  $info['start_date'] = $start_dt->format('Y-m-d H:i:s');
+  $info['end_date'] = $end_dt->format('Y-m-d H:i:s');
+
+  $info['rfc_dates'] = theatrecustom_events_rfc_3339_date($info['start_date'], $info['end_date']);
+
+  // description
+  $description = strlen(trim($node->body['und'][0]['summary'])) ? $node->body['und'][0]['summary'] : $node->body['und'][0]['value'];
+  $description = views_trim_text(array(
+    'max_length' => 300,
+    'word_boundary' => TRUE,
+    'ellipsis' => TRUE,
+    'html' => FALSE,
+   ), $description);
+  $description = drupal_html_to_text($description);
+  $description = str_replace("\n", ' ', $description);
+  $info['description'] = $description;
+
+  // location
+  $info['location'] = '';
+  $venue_nid = isset($node->field_event_venue['und'][0]['target_id']) ? $node->field_event_venue['und'][0]['target_id'] : NULL;
+  if ($venue_nid)
+  {
+    $venue_node = node_load($venue_nid);
+    $info['location'] = check_plain($venue_node->title);
+  }
+
+  switch($cal_type) {
+    case 'google':
+      theatrecustom_events_addcal_google($info);
+      break;
+    case 'yahoo':
+      theatrecustom_events_addcal_yahoo($info);
+      break;
+    default:
+      theatrecustom_events_addcal_ics($info);
+   }
+
+  die;
+}
+
+
+/**
+ *  Generates the markup for the "add to calendar link"
+ */
+// TODO: make sure date is in the future
+// TODO: add to outlook
+function theatrecustom_events_addcal_selector($node, $field_name, $fc_item_id=0, $fc_field_name=0, $fc_delta=0)
+{
+  $parameters = array(
+    $node->nid,
+    $field_name,
+    $fc_item_id,
+    $fc_field_name,
+    $fc_delta,
+  );
+
+  $parameters_path = check_plain(implode('/', $parameters));
+  $css_class = 'uid-' . drupal_html_class(implode('-', $parameters));
+
+  $options = array(
+    array('title'=>t('iCal'), 'url'=>'events/addcal/ical/' . $parameters_path),
+    array('title'=>t('Outlook'), 'url'=>'events/addcal/ical/' . $parameters_path),
+    array('title'=>t('Google Calendar'), 'url'=>'events/addcal/google/' . $parameters_path),
+    array('title'=>t('Yahoo Calendar'), 'url'=>'events/addcal/yahoo/' . $parameters_path),
+  );
+
+  $out = array();
+
+  $out['addcal'] = array(
+    '#prefix' => '<div class="ct-addcal">',
+    '#suffix' => '</div>',
+    '#attached' => array(
+      'js' => array(
+        array('type' => 'file', 'data' => drupal_get_path('module', 'theatrecustom_events') . '/theatrecustom_events_addcal.js'),
+      ),
+      'css' => array(
+        array('type' => 'file', 'data' => drupal_get_path('module', 'theatrecustom_events') . '/theatrecustom_events_addcal.css'),
+      ),
+    ),
+  );
+
+  $out['addcal']['toggle'] = array(
+    '#prefix' => '<a class="ct-addcal-toggle" href="#" data-ct-list-class="' . check_plain($css_class) . '" />',
+    '#markup' => t('Add to calendar'),
+    '#suffix' => '</a>',
+  );
+
+  $out['addcal']['list'] = array(
+    '#prefix' => '<ul class="ct-addcal-list addcal-closed ' . check_plain($css_class) . '">',
+    '#suffix' => '</ul>',
+  );
+
+  foreach($options as $option)
+  {
+    $out['addcal']['list'][] = array(
+      '#prefix' => '<li>',
+      '#markup' => l($option['title'], $option['url'], array('absolute'=>TRUE)),
+      '#suffix' => '</li>',
+    );
+  }
+
+  return drupal_render($out);
+}
+
+
+/**
+ *  Provides iCal file for the specified date
+ */
+function theatrecustom_events_addcal_ics($info)
+{
+  drupal_add_http_header('Content-Type', 'application/calendar; charset=utf-8');
+  drupal_add_http_header('Content-Disposition', 'attachment; filename="' . $info['filename'] . '.ics"');
+  echo 'BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//hacksw/handcal//NONSGML v1.0//EN
+BEGIN:VEVENT
+UID:' . $info['uid'] . '
+DTSTAMP:' . $info['rfc_dates']['start'] . '
+DTSTART:' . $info['rfc_dates']['start'] . '
+DTEND:' . $info['rfc_dates']['end'] . '
+SUMMARY:' . $info['title'] . '
+DESCRIPTION:' . $info['description'] . '
+LOCATION:' . $info['location'] . '
+END:VEVENT
+END:VCALENDAR';
+  drupal_exit();
+}
+
+
+/**
+ * Redirects to a Google Calendar event.
+ */
+function theatrecustom_events_addcal_google($info)
+{
+  $google_url = url('http://www.google.com/calendar/event', array(
+    'query' => array(
+      'action' => 'TEMPLATE',
+      'text' => $info['title'],
+      'dates' => $info['rfc_dates']['both'],
+      'sprop' => 'website:' . $_SERVER['HTTP_HOST'],
+      'location' => $info['location'],
+      'details' => $info['description'],
+      'website' => $info['url'],
+    ),
+  ));
+
+  drupal_goto($google_url);
+}
+
+
+/**
+ * Redirects to a Yahoo Calendar event.
+ */
+function theatrecustom_events_addcal_yahoo($info)
+{
+  $yahoo_url = url('http://calendar.yahoo.com/', array(
+    'query' => array(
+      'v' => 60,
+      'TITLE' => $info['title'],
+      'ST' => $info['rfc_dates']['start'],
+      'ET' => $info['rfc_dates']['end'],
+      'URL' => $_SERVER['HTTP_HOST'],
+      'in_loc' => $info['location'],
+      'desc' => $info['description'],
+    ),
+  ));
+
+  drupal_goto($yahoo_url);
+}
+
+
+/**
+ * This function copied from addtocal module.
+ *
+ * Returns an array containing RFC 3339 formatted start and end dates.
+ *
+ * @param $start
+ *   Start date
+ * @param $end
+ *   End date
+ *
+ * @return array
+ */
+function theatrecustom_events_rfc_3339_date($start, $end) {
+  if (!$end) {
+    $end = $start;
+  }
+
+  $startDate = new DateTime($start);
+  $endDate = new DateTime($end);
+
+  $start_timestamp = $startDate->getTimestamp();
+  $end_timestamp = $endDate->getTimestamp();
+
+  $diff_timestamp = $end_timestamp - $start_timestamp;
+
+  $start_date = gmdate('Ymd', $start_timestamp) . 'T' . gmdate('His', $start_timestamp) . 'Z';
+  $local_start_date = date('Ymd', $start_timestamp) . 'T' . date('His', $start_timestamp) . '';
+  $end_date = gmdate('Ymd', $end_timestamp) . 'T' . gmdate('His', $end_timestamp) . 'Z';
+  $local_end_date = date('Ymd', $end_timestamp) . 'T' . date('His', $end_timestamp) . '';
+
+  $diff_hours = str_pad(round(($diff_timestamp / 60) / 60), 2, '0', STR_PAD_LEFT);
+  $diff_minutes = str_pad(abs(round($diff_timestamp / 60) - ($diff_hours * 60)), 2, '0', STR_PAD_LEFT);
+
+  return array(
+    'start' => $start_date,
+    'end' => $end_date,
+    'both' => $start_date . '/' . $end_date,
+    'local_start' => $local_start_date,
+    'local_end' => $local_end_date,
+  );
+}
+
+
+/**
+ *  Get the display value for the particular event type
+ *  No longer used since the Events on SAC were split into Classes, Camps, and Exhibitions
+ */
+function theatrecustom_events_sac_event_type_display_value($node, $default=NULL)
+{
+  $event_type_performance_tid = 14;
+  $event_type_class_tid = 16;
+  $event_type_camp_tid = 17;
+  $ret = '';
+
+  // for classes and camps display the class type
+  if (isset($node->field_event_type['und'][0]['tid'])
+  && (
+    ($node->field_event_type['und'][0]['tid'] == $event_type_class_tid)
+    || ($node->field_event_type['und'][0]['tid'] == $event_type_camp_tid)
+  ))
+  {
+    if (isset($node->field_class_type['und'][0]['tid']))
+    {
+      $term = taxonomy_term_load($node->field_class_type['und'][0]['tid']);
+      $localized_term = $term ? i18n_taxonomy_localize_terms($term) : NULL;
+      $ret = $localized_term ? $localized_term->name : ($term ? $term->name : NULL);
+    }
+  }
+  // for performances, display the genre
+  elseif (isset($node->field_event_type['und'][0]['tid'])
+  && ($node->field_event_type['und'][0]['tid'] == $event_type_performance_tid))
+  {
+    if (isset($node->field_event_genre['und'][0]['tid']))
+    {
+      $term = taxonomy_term_load($node->field_event_genre['und'][0]['tid']);
+      $localized_term = i18n_taxonomy_localize_terms($term);
+      $ret = $localized_term ? $localized_term->name : ($term ? $term->name : NULL);
+    }
+  }
+  // otherwise, display "Exhibition"
+  else
+  {
+    $ret = $default;
+  }
+
+  return $ret;
+}
+
+
+/**
+ *  Is the specified node an exhibition?
+ *  No longer used since the Events on SAC were split into Classes, Camps, and Exhibitions
+ */
+function theatrecustom_events_sac_is_exhibition($node)
+{
+  $event_type_performance_tid = 14;
+  $event_type_class_tid = 16;
+  $event_type_camp_tid = 17;
+
+  // for classes and camps display the class type
+  if (theatrecustom_events_sac_is_event_type($node, $event_type_class_tid)) return FALSE;
+  elseif (theatrecustom_events_sac_is_event_type($node, $event_type_camp_tid)) return FALSE;
+  elseif (theatrecustom_events_sac_is_event_type($node, $event_type_performance_tid)) return FALSE;
+  else return TRUE;
+}
+
+
+/**
+ *  Generic callback to check an event against a specified type
+ *  No longer used since the Events on SAC were split into Classes, Camps, and Exhibitions
+ */
+function theatrecustom_events_sac_is_event_type($node, $tid)
+{
+  if (isset($node->field_event_type['und'][0]['tid'])
+  && ($node->field_event_type['und'][0]['tid'] == $tid))
+    return TRUE;
+  else
+    return FALSE;
+}
+
+
+/**
+ *  Determines whether the event has already passed
+ */
+function theatrecustom_events_is_over($node)
+{
+  $dates = theatrecustom_events_node_calc_dates($node);
+  if ($dates['max_date'] && $dates['max_date'] < date('Y-m-d H:i:s')) return TRUE;
+  else return FALSE;
+}
+
+
+/**
+ *  Format a date range for the classes and camps details sidebar
+ */
+function theatrecustom_events_date_range_format($start_datetime, $end_datetime=NULL, $lang=NULL, $format_name=NULL) {
+
+  global $language;
+
+  $out = NULL;
+
+  if (!$lang) $lang = $language->language;
+
+  $start_yy  = $start_datetime->format('Y');
+  $start_mm  = $start_datetime->format('m');
+  $start_dd  = $start_datetime->format('d');
+
+  if ($end_datetime) {
+    $end_yy    = $end_datetime->format('Y');
+    $end_mm    = $end_datetime->format('m');
+    $end_dd    = $end_datetime->format('d');
+  }
+
+  // to-the-second comparison of the start and end dates
+  $start_end_different = TRUE;
+  $start_ts = $start_datetime->getTimestamp();
+  $end_ts = $end_datetime->getTimestamp();
+  if ($end_datetime && ($start_ts == $end_ts))
+  {
+     $start_end_different = FALSE;
+  }
+
+  // TODO: FRENCH
+
+  if ($format_name == 'exhibition_details_date') {
+    if ($lang == 'fr') {
+      // start day
+      $out = $start_datetime->format('j');
+      // add "to" if the dates are different
+      if (($start_yy . $start_mm . $start_dd) != ($end_yy . $end_mm . $end_dd)) $out .= ' à ' . $end_datetime->format('j');
+      // month name
+      $out .= ' ' . t($start_datetime->format('F')); 
+      // add the start year if the start/end dates span across years
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ' ' . $start_datetime->format('Y');
+      // add "to" and end day/month if the months are different
+      if ($end_datetime && ($start_yy . $start_mm != $end_yy . $end_mm)) $out .= ' à ' . $end_datetime->format('d') . ' ' . $end_datetime->format('F');
+      // add the end year if the start/end dates span across years
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ' ' . $end_datetime->format('Y');
+    }
+    else {
+       // month and date of start date
+      $out = $start_datetime->format('F') . ' ' . $start_datetime->format('j');
+      // add the start year if the start/end dates span across years
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ',' . $start_datetime->format('Y');
+      // add "to"
+      if ($end_datetime && ($start_yy . $start_mm . $start_dd != $end_yy . $end_mm . $end_dd)) $out .= ' ' . t('to');
+      // add the month if the start and end month are different (or same month, different years)
+      if ($end_datetime && (($start_yy . $start_mm) != ($end_yy . $end_mm))) $out .= ' ' . $end_datetime->format('F');
+      // add the day if start/end are different days
+      if ($end_datetime && (($start_yy . $start_mm . $start_dd) != ($end_yy . $end_mm . $end_dd))) $out .= ' ' . $end_datetime->format('j');
+      // add the end year if the start/end dates span across years.  otherwise, use the start year
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ', ' . $end_datetime->format('Y');
+      // no year displayed unless the date range spans multiple years
+    }
+  } elseif ($format_name == 'exhibition_details_time') {
+    if ($lang == 'fr') {
+      // french
+      $out = $start_datetime->format('H');
+      if ($start_datetime->format('i')) $out .= 'h' . $start_datetime->format('i');
+      if ($end_datetime && $start_end_different)
+      {
+         $out .= ' à ' . $end_datetime->format('H');
+      }
+      if ($end_datetime && $start_end_different && $end_datetime->format('i')) $out .= 'h' . $end_datetime->format('i');
+    } else {
+      // english
+      $out = $start_datetime->format('g:i a');
+      if ($end_datetime && $start_end_different) $out .= ' - ' . $end_datetime->format('g:i a');
+    }
+  } else {
+    if ($lang == 'fr') {
+      // month and date of start date
+      $out = $start_datetime->format('j') . ' ';
+      $out .= t($start_datetime->format('F'));
+      // add the start year if the start/end dates span across years
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ' ' .  $start_datetime->format('Y');
+      // add "to"
+      if ($end_datetime && ($start_yy . $start_mm . $start_dd != $end_yy . $end_mm . $end_dd)) $out .= ' ' . t('à');
+      // add the month if the start and end month are different (or same month, different years)
+      if ($end_datetime && ($start_yy . $start_mm != $end_yy . $end_mm)) $out .= ' ' . t($end_datetime->format('F'));
+      if ($end_datetime && ($start_yy . $start_mm . $start_dd != $end_yy . $end_mm . $end_dd)) $out .= ' ' . $end_datetime->format('j');
+      // add the end year if the start/end dates span across years.  otherwise, use the start year
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ' ' . $end_datetime->format('Y');
+      else $out .= ' ' . $start_datetime->format('Y');
+    } else {
+      // month and date of start date
+      $out = $start_datetime->format('F') . ' ' . $start_datetime->format('j');
+      // add the start year if the start/end dates span across years
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ',' . $start_datetime->format('Y');
+      // add "to"
+      if ($end_datetime && ($start_yy . $start_mm . $start_dd != $end_yy . $end_mm . $end_dd)) $out .= ' ' . t('to');
+      // add the month if the start and end month are different (or same month, different years)
+      if ($end_datetime && ($start_yy . $start_mm != $end_yy . $end_mm)) $out .= ' ' . $end_datetime->format('F');
+      if ($end_datetime && ($start_yy . $start_mm . $start_dd != $end_yy . $end_mm . $end_dd)) $out .= ' ' . $end_datetime->format('j');
+      // add the end year if the start/end dates span across years.  otherwise, use the start year
+      if ($end_datetime && ($start_yy != $end_yy)) $out .= ', ' . $end_datetime->format('Y');
+      else $out .= ', ' . $start_datetime->format('Y');
+    }
+  }
+
+  return $out;
+}
+
+
+/**
+ *  Format a decimal for money
+ */
+function theatrecustom_events_currency_format($value, $lang=NULL) {
+  global $language;
+
+  if (!$lang) $lang = $language->language;
+
+  if ($lang == 'fr') {
+    return number_format($value, 2, ',', ' ') . ' $';
+  }
+  else {
+    return '$' . number_format($value, 2, '.', ',');
+  }
+}
+
+/**
+ *  Rebuild the Search API Events index, to include exhibitions
+ *    Based on:  https://www.drupal.org/node/2632880
+ */
+function _theatrecustom_events_sapi_rebuild_events_index()
+{
+  $index = search_api_index_load('events');
+  $datasource = $index->datasource();
+
+  // Clear all existing tracking items.
+  $datasource->stopTracking(array($index));
+
+  // Update the index datasource bundles. This is mirrored in Features but
+  // needs to be done before revert.
+  $index->options['datasource']['bundles'] = array(
+    'event',
+    'exhibition',
+  );
+
+  $index->save();
+
+  // Start tracking all items using our new bundle settings.
+  $datasource = $index->datasource();
+  $datasource->startTracking(array($index));
+
+  // Clear remote index data.
+  $index->clear();
+
+  // Fetch the total items that need to be tracked.
+  $total = count($datasource->getChangedItems($index));
+  $current = 0;
+  $finished = FALSE;
+
+  while (!$finished) {
+    // re-index 250 at a time.
+    search_api_index_items($index, 250);
+    $current++;
+
+    $items = $datasource->getChangedItems($index);
+
+    $finished = count($items) <= 0 ? TRUE : FALSE;
+  }
+
+  return t('Events index updated.');
+}

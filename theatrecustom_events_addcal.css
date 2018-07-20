@@ -1,0 +1,32 @@
+.ct-addcal-list.addcal-closed {
+  display: none;
+}
+
+.ct-addcal {
+  font-size: 0.7em;
+}
+
+.ct-addcal-toggle {
+  padding-left: 25px;
+  background-image: url('images/add-cal@3x.png');
+  background-position: left center;
+  background-repeat: no-repeat;
+  background-size: 20px 20px;
+  display: block;
+  min-height: 20px;
+  margin: 0.3rem 0 1rem 0;
+}
+
+ul.ct-addcal-list {
+  background-color: #1d1d21;
+  border: 1px solid #fff;
+  border-radius: 3px;
+  color: #8a8a8a;
+  list-style-type: none;
+  padding: 0.5rem 1rem;
+  position: absolute;
+}
+
+ul.ct-addcal-list li {
+  margin: 0;
+}
